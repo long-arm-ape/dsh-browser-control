@@ -91,8 +91,8 @@ try {
 }
 const elapsed = Date.now() - started;
 const message = error instanceof Error ? error.message : String(error);
-check("预算 300ms 时桥在 2.3s 左右超时（证明是预算 + 2000 余量）", elapsed >= 1_500 && elapsed < 6_000, `${elapsed}ms`);
-check("超时文案带的是 2300ms，不是 60000ms", /2300/.test(message), message.slice(0, 120));
+check("预算 300ms 时桥在 8s 地板处超时（预算 + 3 倍余量，覆盖后置探针）", elapsed >= 7_000 && elapsed < 12_000, `${elapsed}ms`);
+check("超时文案带的是 8000ms，不是 60000ms", /8000/.test(message), message.slice(0, 120));
 
 disposers.reverse().forEach(([fn]) => { try { fn(); } catch {} });
 try { ws.close(); } catch {}

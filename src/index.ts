@@ -38,6 +38,13 @@ const NAV_MAX_MS = 120_000
  * of a navigation timeout (nothing was touched) - two very different next steps.
  */
 const BRIDGE_MARGIN_MS = 2_000
+/** Per-mode default wait budgets (milliseconds): the same table the extension uses. */
+const NAV_DEFAULT_BUDGET_MS: Record<string, number> = { none: 0, commit: 4_000, domcontentloaded: 4_000, load: 15_000 }
+/** Normalise `waitUntil`: unknown values fall back to `load` (a typo must not slow anything down). */
+function navWaitMode(value: unknown): string {
+	const text = String(value ?? '').toLowerCase()
+	return text === 'none' || text === 'commit' || text === 'domcontentloaded' || text === 'load' ? text : 'load'
+}
 
 // Re-exported so the policy tables stay testable from the published bundle
 // (verify/verify_policy.mjs reconciles them against the extension's COMMANDS).
@@ -471,7 +478,8 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		parameters: {
 			url: { type: 'string', required: true, description: 'Absolute URL to open in the tab.' },
 			tabId: { type: 'number', description: 'Target tab; defaults to the active tab.' },
-			timeoutMs: { type: 'number', description: `How long to wait for the page load to settle: defaults to 15000, capped at ${NAV_MAX_MS}. Raise it for slow pages instead of retrying; drop it to 3000-5000 when you do not need the page to finish loading and will read/wait afterwards.` },
+			waitUntil: { type: 'string', description: '"load" (default) waits for the full load event; "domcontentloaded" returns as soon as the DOM is usable - faster, but the elements you want may not be mounted yet, so follow with browser_wait instead of retrying blind; "commit" returns when the new document has committed (the URL landed, page still loading); "none" returns immediately.' },
+			timeoutMs: { type: 'number', description: `Budget for the navigation wait: defaults to 15000 with "load", 4000 with "commit"/"domcontentloaded", unused with "none"; capped at ${NAV_MAX_MS}. An explicit value always wins.` },
 		},
 		output: {
 			schema: {
@@ -484,6 +492,10 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 					pendingUrl: { type: 'string' },
 					loadPending: { type: 'boolean' },
 					siteUnreachable: { type: 'boolean' },
+					waitUntil: { type: 'string' },
+					waitedMs: { type: 'number' },
+					readyState: { type: 'string' },
+					pageLoading: { type: 'boolean' },
 				},
 			},
 			render: (_args, value) => {
@@ -499,6 +511,12 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 					const to = typeof value.pendingUrl === 'string' && value.pendingUrl.length > 0 ? value.pendingUrl : 'the requested URL'
 					return [{ type: 'text', text: `Tab ${value.tabId} is still loading ${to} — the load had not settled when the wait budget ran out, so the tab may still be showing ${shows}. Re-check with browser_read before acting on it (or raise timeoutMs).` }]
 				}
+				// commit / domcontentloaded returned before the page finished loading: the
+				// document is in place (reading works), but later content may still arrive.
+				if (value.pageLoading === true) {
+					const state = typeof value.readyState === 'string' ? `, readyState=${value.readyState}` : ''
+					return [{ type: 'text', text: `Tab ${value.tabId} now shows ${shows} and is still loading (${String(value.waitUntil ?? 'load')}${state}) — the document committed, so reading works, but later content may still arrive. Use browser_wait (selector/text/fn) for what you need instead of retrying the navigation.` }]
+				}
 				if (typeof value.pendingUrl === 'string' && value.pendingUrl.length > 0) {
 					return [{ type: 'text', text: `Tab ${value.tabId} shows ${shows} and is navigating to ${value.pendingUrl}` }]
 				}
@@ -510,11 +528,15 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 		async execute(args, exec) {
 			const params: Record<string, unknown> = { url: args.url }
 			if (args.tabId !== undefined) params.tabId = args.tabId
+			const mode = navWaitMode(args.waitUntil)
+			if (args.waitUntil !== undefined) params.waitUntil = args.waitUntil
 			const budgetMs = typeof args.timeoutMs === 'number' && Number.isFinite(args.timeoutMs)
 				? Math.min(NAV_MAX_MS, Math.max(100, Math.trunc(args.timeoutMs)))
-				: 15_000
-			params.timeoutMs = budgetMs
-			const raw = await controller.execute('nav', params, exec.signal, budgetMs + BRIDGE_MARGIN_MS) as {
+				: (NAV_DEFAULT_BUDGET_MS[mode] ?? 15_000)
+			if (budgetMs > 0) params.timeoutMs = budgetMs
+			// The extension probes the landed URL (2s) and, on an error page, its text (2s)
+			// AFTER the wait settles; the ceiling must cover those or the bridge fires first.
+			const raw = await controller.execute('nav', params, exec.signal, Math.max(8_000, budgetMs + BRIDGE_MARGIN_MS * 3)) as {
 				tabId: number
 				title?: string
 				url?: string
@@ -522,16 +544,29 @@ function applyBrowserTools(ctx: Context, controller: BridgeController): void {
 				loadPending?: boolean
 				/** `true`, or `{ reason: 'dns' | 'unreachable' }` as the extension actually sends it. */
 				siteUnreachable?: boolean | { reason?: string }
+				/** Which wait mode actually ran, and how long it took (read back to the model). */
+				waitUntil?: string
+				waitedMs?: number
+				readyState?: string
+				/** Set with "commit"/"domcontentloaded": the document is in place but the page is still loading. */
+				pageLoading?: boolean
 			}
 			// The declared schema is closed, so the fields describing a navigation that did
 			// not arrive have to be carried over on purpose. The old shape check
 			// (`siteUnreachable === true`) also missed the object the extension really
 			// sends, so an unreachable target came back as a plain success.
-			const out: { tabId: number; url?: string; title?: string; pendingUrl?: string; loadPending?: boolean; siteUnreachable?: boolean } = { tabId: raw.tabId }
+			const out: {
+				tabId: number; url?: string; title?: string; pendingUrl?: string; loadPending?: boolean; siteUnreachable?: boolean
+				waitUntil?: string; waitedMs?: number; readyState?: string; pageLoading?: boolean
+			} = { tabId: raw.tabId }
 			if (typeof raw.url === 'string') out.url = raw.url
 			if (typeof raw.title === 'string') out.title = raw.title
 			if (typeof raw.pendingUrl === 'string') out.pendingUrl = raw.pendingUrl
 			if (raw.loadPending === true) out.loadPending = true
+			if (typeof raw.waitUntil === 'string') out.waitUntil = raw.waitUntil
+			if (typeof raw.waitedMs === 'number') out.waitedMs = raw.waitedMs
+			if (typeof raw.readyState === 'string') out.readyState = raw.readyState
+			if (raw.pageLoading === true) out.pageLoading = true
 			const unreachable = raw.siteUnreachable === true
 				|| (typeof raw.siteUnreachable === 'object' && raw.siteUnreachable !== null)
 			if (unreachable) out.siteUnreachable = true

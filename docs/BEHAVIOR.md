@@ -10,7 +10,9 @@ Agent 和上层脚本可以依赖的确定性语义。违反这些契约视为 b
 
 ## 自动等待
 
-- `browser_navigate` 等待新文档落地（默认 15s，`timeoutMs` 可调，上限 120s）后才返回；`tabs.open` 走同一套等待，等待预算由扩展侧控制（15s）；15s 内没等到时结果带 `loadPending: true` 与 `pendingUrl`，`browser_navigate` 的文案会说「仍在加载」而不是「已显示」，模型不该把没落地的导航当成功。
+- `browser_navigate` / `tabs.open` 默认等到 `load`（上限 15s，`timeoutMs` 可调，上限 120s）；`waitUntil` 可显式改成 `commit`（新文档落地即回，4s 预算）、`domcontentloaded`（DOM 可用即回，4s 预算）或 `none`（不等，立刻回）。**默认值刻意保持 `load`**：改默认会让现存调用悄悄变毛躁，要快由调用方自己选。
+- 等待期内没等到新文档时结果带 `loadPending: true` 与 `pendingUrl`（「仍在加载」而不是「已显示」）；`commit` / `domcontentloaded` 提前返回时文档已在位、但页面可能仍在加载，此时带 `pageLoading: true`，并可读 `readyState`。两种标记都不是成功声明，模型该用 `browser_wait`（selector/text/fn）去等真正需要的东西。
+- 「新文档到达」的权威信号是 CDP 的 `Page.frameNavigated`（只看主框架）：**不能用「地址变了」判定** —— 同站重定向/刷新会回到同一个地址（`www.bing.com` → `cn.bing.com` 往返），地址启发式会等满预算。`nav` 与 `tabs.open` 共用同一份到达等待器与预算表。
 - **不保证** SPA 路由或懒渲染内容就绪——导航返回后再用 `browser_wait` 显式等目标元素。
 - 「压根没发生」的导航也不算到位：如果整个等待期间从没观察到 `loading`，宽限期后会拿标签**真正落到的 URL** 与请求的目标比对（忽略 hash 片段与末尾斜杠），不等就报 `loadPending`。所以「点了变成下载」「目标被 Chrome 拒载」不会 0ms 伪装成成功；而**导航到已经开着的那个地址**仍然算成功（不误报）。实测台：`verify/verify_nav_landing.mjs`。
 
